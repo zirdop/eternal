@@ -62,7 +62,7 @@ def register_command():
     """Register the global user-installed /raid command."""
     command = {
         "name": "raid",
-        "description": "Open your private message panel",
+        "description": "Open panel",
         "type": 1,
         "integration_types": [1],
         "contexts": [0, 2]
@@ -138,7 +138,7 @@ def interactions():
         }]
 
         return private_response(
-            "Your fixed message is ready. Press the button to send it.",
+            "Spam button to raid!",
             components
         )
 
