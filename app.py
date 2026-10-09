@@ -16,24 +16,25 @@ PUBLIC_KEY = os.environ.get("PUBLIC_KEY", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
 DISCORD_API = "https://discord.com/api/v10"
+MAX_REPEATS = 500
 
 
 def register_command():
-    """Register /say for user-installed apps."""
+    """Register /raid for user-installed apps."""
     if not APP_ID or not BOT_TOKEN:
-        print("Missing APP_ID or BOT_TOKEN; command not registered.")
+        print("Missing APP_ID or BOT_TOKEN.")
         return
 
     command = {
         "name": "raid",
-        "description": "raid or something yeah",
+        "description": "Send a custom message a few times",
         "integration_types": [1],
         "contexts": [0, 2],
         "options": [
             {
                 "type": 3,
                 "name": "message",
-                "description": "text",
+                "description": "Your custom message",
                 "required": True,
                 "max_length": 2000
             },
@@ -43,7 +44,7 @@ def register_command():
                 "description": "Number of copies (1 to 5)",
                 "required": False,
                 "min_value": 1,
-                "max_value": 500
+                "max_value": MAX_REPEATS
             }
         ]
     }
@@ -56,13 +57,14 @@ def register_command():
             timeout=15
         )
         response.raise_for_status()
-        print("Slash command /say registered.")
+        print("Slash command /raid registered successfully.")
+
     except requests.RequestException as error:
         print("Command registration failed:", error)
 
 
 def send_extra_copies(app_id, token, message, repeats):
-    """Send the remaining copies as interaction follow-ups."""
+    """Send remaining copies as interaction follow-ups."""
     url = f"{DISCORD_API}/webhooks/{app_id}/{token}"
 
     for _ in range(repeats - 1):
@@ -79,7 +81,11 @@ def send_extra_copies(app_id, token, message, repeats):
             )
 
             if not response.ok:
-                print("Follow-up failed:", response.status_code)
+                print(
+                    "Follow-up failed:",
+                    response.status_code,
+                    response.text[:300]
+                )
                 break
 
         except requests.RequestException as error:
@@ -94,7 +100,7 @@ def health():
 
 @app.post("/interactions")
 def interactions():
-    # Verify that this request really came from Discord.
+    # Verify that the request came from Discord.
     signature = request.headers.get("X-Signature-Ed25519", "")
     timestamp = request.headers.get("X-Signature-Timestamp", "")
     raw_body = request.get_data()
@@ -116,24 +122,28 @@ def interactions():
     except (ValueError, UnicodeDecodeError):
         return "Invalid JSON", 400
 
-    # Discord uses PING to test the endpoint.
+    # Discord endpoint verification.
     if payload.get("type") == 1:
         return jsonify({"type": 1})
 
-    # Only handle slash commands.
+    # Handle application commands only.
     if payload.get("type") != 2:
         return jsonify({
             "type": 4,
             "data": {
-                "content": "This interaction isn't supported.",
+                "content": "Unsupported interaction.",
                 "flags": 64
             }
         })
 
-    if payload.get("data", {}).get("name") != "say":
+    # The registered command and handler must match.
+    if payload.get("data", {}).get("name") != "raid":
         return jsonify({
             "type": 4,
-            "data": {"content": "Unknown command.", "flags": 64}
+            "data": {
+                "content": "Unknown command. Try /raid.",
+                "flags": 64
+            }
         })
 
     options = {
@@ -148,12 +158,12 @@ def interactions():
         return jsonify({
             "type": 4,
             "data": {
-                "content": "Please enter a non-empty message.",
+                "content": "Please enter a message.",
                 "flags": 64
             }
         })
 
-    if not isinstance(repeats, int) or not 1 <= repeats <= 5:
+    if not isinstance(repeats, int) or not 1 <= repeats <= MAX_REPEATS:
         return jsonify({
             "type": 4,
             "data": {
@@ -162,8 +172,7 @@ def interactions():
             }
         })
 
-    # Respond immediately: Discord requires a response within 3 seconds.
-    # This first response is also the first copy of the message.
+    # Send the first copy as the interaction response.
     result = jsonify({
         "type": 4,
         "data": {
@@ -172,18 +181,23 @@ def interactions():
         }
     })
 
-    # Queue any remaining copies after preparing the initial response.
+    # Send any remaining copies after the initial response.
     if repeats > 1:
         threading.Thread(
             target=send_extra_copies,
-            args=(APP_ID, payload["token"], message, repeats),
+            args=(
+                APP_ID,
+                payload["token"],
+                message,
+                repeats
+            ),
             daemon=True
         ).start()
 
     return result
 
 
-# Register the slash command when the web service starts.
+# Register /raid when the service starts.
 register_command()
 
 
