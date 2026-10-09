@@ -14,13 +14,12 @@ app = Flask(__name__)
 # SETTINGS — ONLY CHANGE THESE IN THE CODE
 # ==================================================
 
-SET_MESSAGE = "YOUR FIXED MESSAGE HERE"
+SET_MESSAGE = "# GET RAIDED BY https://discord.gg/DdgNaCz8zR ! JOIN https://discord.gg/DdgNaCz8zR TO USE THIS RAID BOT YOURSELF! (0 SERVER PERMS NEEDED AND THE BOT DOES NOT NEED TO BE IN THE SERVER!)"
 
 # Number of public messages sent per button click
-REPEATS_PER_CLICK = 3
+REPEATS_PER_CLICK = 5
 
-# Safety limits
-MAX_REPEATS = 5
+MAX_REPEATS = 100
 CLICK_COOLDOWN_SECONDS = 1
 
 # ==================================================
