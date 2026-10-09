@@ -1,208 +1,257 @@
 
 import os
-import json
 import time
 import threading
-
 import requests
-from flask import Flask, request, jsonify
+
+from flask import Flask, request
 from nacl.signing import VerifyKey
 from nacl.exceptions import BadSignatureError
 
 app = Flask(__name__)
 
-APP_ID = os.environ.get("APP_ID", "")
-PUBLIC_KEY = os.environ.get("PUBLIC_KEY", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+# ==================================================
+# SETTINGS — ONLY CHANGE THESE IN THE CODE
+# ==================================================
 
-DISCORD_API = "https://discord.com/api/v10"
-MAX_REPEATS = 500
+SET_MESSAGE = "YOUR FIXED MESSAGE HERE"
+
+# Number of public messages sent per button click
+REPEATS_PER_CLICK = 3
+
+# Safety limits
+MAX_REPEATS = 5
+CLICK_COOLDOWN_SECONDS = 1
+
+# ==================================================
+# DISCORD / RENDER SETTINGS
+# Set these in Render Environment Variables
+# ==================================================
+
+APP_ID = os.environ["APP_ID"]
+PUBLIC_KEY = os.environ["PUBLIC_KEY"]
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+
+API_BASE = "https://discord.com/api/v10"
+
+last_click = {}
+click_lock = threading.Lock()
+
+
+def get_user_id(interaction):
+    """Get the user ID in either a server or DM context."""
+    if interaction.get("member"):
+        return interaction["member"]["user"]["id"]
+
+    return interaction.get("user", {}).get("id")
+
+
+def private_response(content, components=None):
+    """Return a response visible only to the person interacting."""
+    data = {
+        "content": content,
+        "flags": 64
+    }
+
+    if components:
+        data["components"] = components
+
+    return {"type": 4, "data": data}
 
 
 def register_command():
-    """Register /raid for user-installed apps."""
-    if not APP_ID or not BOT_TOKEN:
-        print("Missing APP_ID or BOT_TOKEN.")
-        return
-
+    """Register the global user-installed /raid command."""
     command = {
         "name": "raid",
-        "description": "Send a custom message a few times",
+        "description": "Open your private message panel",
+        "type": 1,
         "integration_types": [1],
-        "contexts": [0, 2],
-        "options": [
-            {
-                "type": 3,
-                "name": "message",
-                "description": "Your custom message",
-                "required": True,
-                "max_length": 2000
-            },
-            {
-                "type": 4,
-                "name": "repeats",
-                "description": "Number of copies (1 to 5)",
-                "required": False,
-                "min_value": 1,
-                "max_value": MAX_REPEATS
-            }
-        ]
+        "contexts": [0, 2]
     }
 
-    try:
-        response = requests.put(
-            f"{DISCORD_API}/applications/{APP_ID}/commands",
-            headers={"Authorization": f"Bot {BOT_TOKEN}"},
-            json=[command],
-            timeout=15
-        )
-        response.raise_for_status()
+    response = requests.put(
+        f"{API_BASE}/applications/{APP_ID}/commands",
+        headers={
+            "Authorization": f"Bot {BOT_TOKEN}",
+            "Content-Type": "application/json"
+        },
+        json=[command],
+        timeout=15
+    )
+
+    print("Command registration:", response.status_code)
+    if not response.ok:
+        print("Registration error:", response.text)
+    else:
         print("Slash command /raid registered successfully.")
 
-    except requests.RequestException as error:
-        print("Command registration failed:", error)
+
+@app.route("/", methods=["GET"])
+def home():
+    return "Discord interaction app is running!", 200
 
 
-def send_extra_copies(app_id, token, message, repeats):
-    """Send remaining copies as interaction follow-ups."""
-    url = f"{DISCORD_API}/webhooks/{app_id}/{token}"
+@app.route("/interactions", methods=["POST"])
+def interactions():
+    body = request.get_data()
+    signature = request.headers.get("X-Signature-Ed25519", "")
+    timestamp = request.headers.get("X-Signature-Timestamp", "")
 
-    for _ in range(repeats - 1):
+    # Verify that this request really came from Discord.
+    try:
+        verify_key = VerifyKey(bytes.fromhex(PUBLIC_KEY))
+        verify_key.verify(
+            timestamp.encode() + body,
+            bytes.fromhex(signature)
+        )
+    except (BadSignatureError, ValueError):
+        return "Invalid request signature", 401
+
+    interaction = request.get_json(silent=True) or {}
+    interaction_type = interaction.get("type")
+
+    # Discord endpoint verification ping
+    if interaction_type == 1:
+        return {"type": 1}
+
+    # Slash command: /raid
+    if interaction_type == 2:
+        command = interaction.get("data", {}).get("name")
+
+        if command != "raid":
+            return private_response("Unknown command.")
+
+        user_id = get_user_id(interaction)
+        if not user_id:
+            return private_response("Could not identify the user.")
+
+        # Only the person who ran /raid is authorized to use its button.
+        button_id = f"send_fixed_message:{user_id}"
+
+        components = [{
+            "type": 1,
+            "components": [{
+                "type": 2,
+                "style": 1,
+                "label": "Send message",
+                "custom_id": button_id
+            }]
+        }]
+
+        return private_response(
+            "Your fixed message is ready. Press the button to send it.",
+            components
+        )
+
+    # Button click
+    if interaction_type == 3:
+        custom_id = interaction.get("data", {}).get("custom_id", "")
+        user_id = get_user_id(interaction)
+
+        if not custom_id.startswith("send_fixed_message:"):
+            return private_response("Unknown button.")
+
+        allowed_user_id = custom_id.split(":", 1)[1]
+
+        # Stop other people from using your private button.
+        if not user_id or user_id != allowed_user_id:
+            return private_response(
+                "This button belongs to the person who opened it."
+            )
+
+        # Small per-user cooldown to prevent accidental channel flooding.
+        now = time.time()
+
+        with click_lock:
+            previous_click = last_click.get(user_id, 0)
+
+            if now - previous_click < CLICK_COOLDOWN_SECONDS:
+                return private_response(
+                    "Please wait a moment before clicking again."
+                )
+
+            last_click[user_id] = now
+
+        repeats = max(1, min(REPEATS_PER_CLICK, MAX_REPEATS))
+
+        # The first message is sent as the public button response.
+        # Additional messages are sent as public follow-ups.
+        token = interaction.get("token")
+
+        if not token:
+            return private_response("Missing interaction token.")
+
+        threading.Thread(
+            target=send_messages,
+            args=(token, repeats - 1),
+            daemon=True
+        ).start()
+
+        return {
+            "type": 4,
+            "data": {
+                "content": SET_MESSAGE,
+                "allowed_mentions": {"parse": []}
+            }
+        }
+
+    return private_response("Unsupported interaction.")
+
+
+def send_messages(interaction_token, additional_count):
+    """Send the remaining fixed messages as public follow-ups."""
+    if additional_count <= 0:
+        return
+
+    webhook_url = (
+        f"{API_BASE}/webhooks/{APP_ID}/{interaction_token}"
+    )
+
+    for _ in range(additional_count):
         time.sleep(1)
 
         try:
             response = requests.post(
-                url,
+                webhook_url,
                 json={
-                    "content": message,
+                    "content": SET_MESSAGE,
                     "allowed_mentions": {"parse": []}
                 },
-                timeout=10
+                timeout=15
             )
+
+            if response.status_code == 429:
+                # Respect Discord's rate-limit instruction.
+                details = response.json()
+                time.sleep(
+                    min(float(details.get("retry_after", 1)), 5)
+                )
+                response = requests.post(
+                    webhook_url,
+                    json={
+                        "content": SET_MESSAGE,
+                        "allowed_mentions": {"parse": []}
+                    },
+                    timeout=15
+                )
 
             if not response.ok:
                 print(
-                    "Follow-up failed:",
+                    "Could not send follow-up:",
                     response.status_code,
-                    response.text[:300]
+                    response.text
                 )
-                break
+                return
 
         except requests.RequestException as error:
-            print("Follow-up request failed:", error)
-            break
+            print("Follow-up error:", error)
+            return
 
 
-@app.get("/")
-def health():
-    return "Discord interaction endpoint is online.", 200
-
-
-@app.post("/interactions")
-def interactions():
-    # Verify that the request came from Discord.
-    signature = request.headers.get("X-Signature-Ed25519", "")
-    timestamp = request.headers.get("X-Signature-Timestamp", "")
-    raw_body = request.get_data()
-
-    if not PUBLIC_KEY or not signature or not timestamp:
-        return "Missing signature information", 401
-
-    try:
-        verifier = VerifyKey(bytes.fromhex(PUBLIC_KEY))
-        verifier.verify(
-            timestamp.encode("utf-8") + raw_body,
-            bytes.fromhex(signature)
-        )
-    except (BadSignatureError, ValueError):
-        return "Invalid signature", 401
-
-    try:
-        payload = json.loads(raw_body)
-    except (ValueError, UnicodeDecodeError):
-        return "Invalid JSON", 400
-
-    # Discord endpoint verification.
-    if payload.get("type") == 1:
-        return jsonify({"type": 1})
-
-    # Handle application commands only.
-    if payload.get("type") != 2:
-        return jsonify({
-            "type": 4,
-            "data": {
-                "content": "Unsupported interaction.",
-                "flags": 64
-            }
-        })
-
-    # The registered command and handler must match.
-    if payload.get("data", {}).get("name") != "raid":
-        return jsonify({
-            "type": 4,
-            "data": {
-                "content": "Unknown command. Try /raid.",
-                "flags": 64
-            }
-        })
-
-    options = {
-        option["name"]: option.get("value")
-        for option in payload.get("data", {}).get("options", [])
-    }
-
-    message = options.get("message", "")
-    repeats = options.get("repeats", 1)
-
-    if not isinstance(message, str) or not message.strip():
-        return jsonify({
-            "type": 4,
-            "data": {
-                "content": "Please enter a message.",
-                "flags": 64
-            }
-        })
-
-    if not isinstance(repeats, int) or not 1 <= repeats <= MAX_REPEATS:
-        return jsonify({
-            "type": 4,
-            "data": {
-                "content": "Repeats must be between 1 and 5.",
-                "flags": 64
-            }
-        })
-
-    # Send the first copy as the interaction response.
-    result = jsonify({
-        "type": 4,
-        "data": {
-            "content": message,
-            "allowed_mentions": {"parse": []}
-        }
-    })
-
-    # Send any remaining copies after the initial response.
-    if repeats > 1:
-        threading.Thread(
-            target=send_extra_copies,
-            args=(
-                APP_ID,
-                payload["token"],
-                message,
-                repeats
-            ),
-            daemon=True
-        ).start()
-
-    return result
-
-
-# Register /raid when the service starts.
+# Register the command when the app starts.
 register_command()
 
 
 if __name__ == "__main__":
-    app.run(
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", "10000"))
-    )
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
